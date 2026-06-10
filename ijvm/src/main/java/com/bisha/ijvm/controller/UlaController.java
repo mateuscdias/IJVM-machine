@@ -1,6 +1,9 @@
 package com.bisha.ijvm.controller;
 
+import com.bisha.ijvm.model.BancoRegistradores;
+import com.bisha.ijvm.model.EstadoMic1;
 import com.bisha.ijvm.model.EstadoULA;
+import com.bisha.ijvm.service.Mic1Service;
 import com.bisha.ijvm.service.UlaService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +15,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -52,11 +56,18 @@ import java.util.stream.Collectors;
 public class UlaController {
 
     /**
-     * The service layer that implements the MIC-1 ALU logic.
-     * This dependency is injected by Spring's dependency injection container.
+     * Serviço da Etapa 1 — ULA básica de 6 bits.
+     * Injetado pelo container de dependências do Spring.
      */
     @Autowired
     private UlaService ulaService;
+
+    /**
+     * Serviço da Etapa 2 — caminho de dados completo da Mic-1 (Tarefas 1 e 2).
+     * Injetado pelo container de dependências do Spring.
+     */
+    @Autowired
+    private Mic1Service mic1Service;
 
     /**
      * Default constructor for UlaController.
@@ -246,5 +257,200 @@ public class UlaController {
             error.put("erro", "Erro ao processar arquivo: " + e.getMessage());
             return ResponseEntity.badRequest().body(error);
         }
+    }
+
+    // =========================================================================
+    // ETAPA 2 — TAREFA 1: ULA expandida + Deslocador (8 bits)
+    // =========================================================================
+
+    /**
+     * Executa um programa da Tarefa 1 da Etapa 2 (palavras de controle de 8 bits).
+     *
+     * <p>Expande a ULA da Etapa 1 com dois sinais de deslocador pós-ULA:
+     * {@code SLL8} (deslocamento lógico esquerdo de 8 bits) e
+     * {@code SRA1} (deslocamento aritmético direito de 1 bit).
+     * Gera as flags de condição {@code N} (negativo) e {@code Z} (zero) com base em Sd.</p>
+     *
+     * <p><b>Formato da requisição JSON:</b></p>
+     * <pre>
+     * {
+     *   "instrucoes": ["10111100", "01111100"],
+     *   "a": 1,
+     *   "b": -2147483648
+     * }
+     * </pre>
+     * <p>Os campos {@code a} e {@code b} são opcionais; o padrão é
+     * {@code a=0x00000001} e {@code b=0x80000000}.</p>
+     *
+     * <p><b>Exemplo de uso com cURL:</b></p>
+     * <pre>
+     * curl -X POST http://localhost:8080/api/ula/mic1/tarefa1/executar \
+     *   -H 'Content-Type: application/json' \
+     *   -d '{"instrucoes": ["10111100", "01111100"]}'
+     * </pre>
+     *
+     * @param request Mapa JSON com "instrucoes" (List&lt;String&gt;) e opcionalmente "a" e "b" (int)
+     * @return JSON com "log" (lista de ciclos), "logTexto" (log formatado) e "totalCiclos"
+     */
+    @PostMapping("/mic1/tarefa1/executar")
+    public ResponseEntity<Map<String, Object>> executarMic1T1(
+            @RequestBody Map<String, Object> request) {
+
+        @SuppressWarnings("unchecked")
+        List<String> instrucoes = (List<String>) request.get("instrucoes");
+
+        if (instrucoes == null || instrucoes.isEmpty()) {
+            Map<String, Object> erro = new LinkedHashMap<>();
+            erro.put("erro", "Nenhuma instrução fornecida.");
+            return ResponseEntity.badRequest().body(erro);
+        }
+
+        // Valores iniciais — padrão do teste da Tarefa 1 (podem ser sobrescritos via JSON)
+        int initialA = request.containsKey("a")
+            ? ((Number) request.get("a")).intValue()
+            : 0x00000001;                         // a = 1
+        int initialB = request.containsKey("b")
+            ? ((Number) request.get("b")).intValue()
+            : 0x80000000;                         // b = -2147483648 (MSB=1)
+
+        try {
+            Map<String, Object> resultado =
+                mic1Service.processarProgramaMic1T1(instrucoes, initialA, initialB);
+            return ResponseEntity.ok(resultado);
+        } catch (Exception e) {
+            Map<String, Object> erro = new LinkedHashMap<>();
+            erro.put("erro", "Erro ao executar programa Mic-1 T1: " + e.getMessage());
+            return ResponseEntity.badRequest().body(erro);
+        }
+    }
+
+    // =========================================================================
+    // ETAPA 2 — TAREFA 2: Banco de Registradores + Barramentos (21 bits)
+    // =========================================================================
+
+    /**
+     * Executa um programa da Tarefa 2 da Etapa 2 a partir de dois arquivos enviados via upload.
+     *
+     * <p>Simula o caminho de dados completo da Mic-1: decodifica palavras de 21 bits,
+     * gerencia o banco de registradores e aplica os Barramentos B e C.</p>
+     *
+     * <p><b>Formato do arquivo {@code programa}:</b> cada linha contém uma instrução
+     * binária de 21 bits. Linhas vazias encerram a execução (EOP).</p>
+     *
+     * <p><b>Formato do arquivo {@code registradores}:</b></p>
+     * <pre>
+     * h   = 00000000000000000000000000000001
+     * mbr = 10000001
+     * sp  = 00000000000000000000000000000000
+     * ...
+     * </pre>
+     *
+     * <p><b>Exemplo de uso com cURL:</b></p>
+     * <pre>
+     * curl -X POST http://localhost:8080/api/ula/mic1/tarefa2/executar-arquivo \
+     *   -F 'programa=@programa_etapa2_tarefa2.txt' \
+     *   -F 'registradores=@registradores_etapa2_tarefa2.txt'
+     * </pre>
+     *
+     * @param programa      Arquivo com instruções de 21 bits (texto puro)
+     * @param registradores Arquivo com os valores iniciais dos registradores
+     * @return JSON com "log" (lista de {@link EstadoMic1}), "logTexto" (texto formatado),
+     *         "registradoresIniciais" e "totalCiclos"
+     */
+    @PostMapping("/mic1/tarefa2/executar-arquivo")
+    public ResponseEntity<Map<String, Object>> executarMic1T2Arquivo(
+            @RequestParam("programa")      MultipartFile programa,
+            @RequestParam("registradores") MultipartFile registradores) {
+
+        try {
+            // Lê o arquivo de programa — filtra comentários e brancos
+            List<String> instrucoes;
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(programa.getInputStream(), StandardCharsets.UTF_8))) {
+                instrucoes = reader.lines()
+                    .map(String::trim)
+                    .filter(l -> !l.startsWith("#"))   // ignora comentários
+                    .collect(Collectors.toList());
+            }
+
+            if (instrucoes.isEmpty()) {
+                Map<String, Object> erro = new LinkedHashMap<>();
+                erro.put("erro", "Arquivo de programa vazio ou sem instruções válidas.");
+                return ResponseEntity.badRequest().body(erro);
+            }
+
+            // Lê e carrega os registradores iniciais
+            String conteudoRegistradores;
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(registradores.getInputStream(), StandardCharsets.UTF_8))) {
+                conteudoRegistradores = reader.lines()
+                    .collect(Collectors.joining("\n"));
+            }
+
+            BancoRegistradores banco = new BancoRegistradores();
+            banco.carregarDeString(conteudoRegistradores);
+
+            // Executa o programa
+            Map<String, Object> resultado =
+                mic1Service.processarProgramaMic1(instrucoes, banco);
+
+            // Serializa a lista de EstadoMic1 para JSON-friendly
+            @SuppressWarnings("unchecked")
+            List<EstadoMic1> logEstados = (List<EstadoMic1>) resultado.get("log");
+            List<Map<String, Object>> logSerializado = new ArrayList<>();
+            for (EstadoMic1 estado : logEstados) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("ciclo",               estado.getCiclo());
+                entry.put("ir",                  estado.getIr());
+                entry.put("irFormatado",         estado.getIRFormatado());
+                entry.put("bBus",                estado.getNomeBBus());
+                entry.put("cBus",                estado.getNomesCBus());
+                entry.put("registradoresAntes",  converterRegistradores(estado.getRegistradoresAntes()));
+                entry.put("registradoresDepois", converterRegistradores(estado.getRegistradoresDepois()));
+                entry.put("entradaA",  estado.getEntradaA());
+                entry.put("entradaB",  estado.getEntradaB());
+                entry.put("s",         estado.getS());
+                entry.put("sBin",      EstadoMic1.formatarBin32(estado.getS()));
+                entry.put("sd",        estado.getSd());
+                entry.put("sdBin",     EstadoMic1.formatarBin32(estado.getSd()));
+                entry.put("n",         estado.getFlagN());
+                entry.put("z",         estado.getFlagZ());
+                entry.put("vaiUm",     estado.getVaiUm());
+                logSerializado.add(entry);
+            }
+
+            Map<String, Object> resposta = new LinkedHashMap<>();
+            resposta.put("registradoresIniciais", resultado.get("registradoresIniciais"));
+            resposta.put("log",         logSerializado);
+            resposta.put("logTexto",    resultado.get("logTexto"));
+            resposta.put("totalCiclos", resultado.get("totalCiclos"));
+            return ResponseEntity.ok(resposta);
+
+        } catch (Exception e) {
+            Map<String, Object> erro = new LinkedHashMap<>();
+            erro.put("erro", "Erro ao processar arquivos Mic-1 T2: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(erro);
+        }
+    }
+
+    /**
+     * Converte o mapa de registradores (nome → int) em mapa de strings binárias
+     * para serialização JSON amigável ao frontend.
+     * O registrador MBR é formatado com 8 bits; os demais com 32 bits.
+     *
+     * @param registradores Mapa nome→valor (inteiro)
+     * @return Mapa nome→string binária
+     */
+    private Map<String, String> converterRegistradores(Map<String, Integer> registradores) {
+        Map<String, String> resultado = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> entry : registradores.entrySet()) {
+            String nome  = entry.getKey();
+            int valor    = entry.getValue();
+            String binStr = "mbr".equals(nome)
+                ? EstadoMic1.formatarBin8(valor)
+                : EstadoMic1.formatarBin32(valor);
+            resultado.put(nome, binStr);
+        }
+        return resultado;
     }
 }
