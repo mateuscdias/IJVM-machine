@@ -1,304 +1,301 @@
 #!/usr/bin/env python3
 """
-MIC-1 ALU Execution Log Generator
+MIC-1 ALU Execution Log Generator (v2 – 8-bit extension)
 
-This script automates the process of executing MIC-1 ALU programs and generating
-detailed execution logs by interacting with the Spring Boot REST API.
+Supports both the original 6-bit instruction set and the extended 8-bit
+instruction set with SLL8 / SRA1 shifter outputs and N / Z flags.
 
-Overview:
-    Uploads a text file containing 6-bit binary instructions to the IJVM ALU
-    service, retrieves the execution results, and formats them into a readable
-    .log file with cycle-by-cycle state information.
+Usage:
+    python3 gerar_log.py <arquivo.txt>               # auto-detect bit width
+    python3 gerar_log.py <arquivo.txt> --bits 6      # force 6-bit mode
+    python3 gerar_log.py <arquivo.txt> --bits 8      # force 8-bit mode
+    python3 gerar_log.py <arquivo.txt> --bits 8 --a -2147483648 --b 1
 
-Features:
-    - Automatic file validation before upload
-    - Timestamp-based log file naming to prevent overwrites
-    - Organized storage in dedicated 'logs/' directory
-    - Full state capture (PC, IR, registers A/B, result S, carry-out)
-    - Windows-compatible line endings (CRLF)
-    - Detailed error handling and user feedback
+Bit-width auto-detection:
+    If the first valid instruction line is 8 characters long -> 8-bit mode.
+    If it is 6 characters long -> 6-bit mode.
 
-Workflow:
-    1. Validates input file existence
-    2. Uploads file to http://localhost:8080/api/ula/executar-arquivo
-    3. Parses JSON response with execution log
-    4. Creates logs/ directory if it doesn't exist
-    5. Generates formatted .log file with timestamp
-    6. Displays summary and file location
-
-Dependencies:
-    - requests library (HTTP client)
-    - Python 3.6+ for f-string support
-
-Usage Example:
-    $ python3 gerar_log.py etapa1.txt
-    📤 Enviando arquivo: etapa1.txt
-    ✅ Log gerado: logs/etapa1_20231201_143025.log
-       Total de ciclos: 4
-
-Author: Miguel Mochizuki Silva, Mateus C. Dias, Joaquim Germano Félix, Gabriel Bringel Gonçalves
-Version: 1.0
-Date: 2024
-License: Proprietary
+Author: Miguel Mochizuki Silva, Mateus C. Dias, Joaquim Germano Felix,
+        Gabriel Bringel Goncalves
+Version: 2.2
 """
 
 import requests
 import sys
 import os
+import argparse
 from datetime import datetime
 from typing import Optional, Dict, Any
 
 
-def gerar_log_com_upload(arquivo_entrada: str) -> None:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def to_bin_32bits(valor: int) -> str:
+    """Return a zero-padded 32-bit binary string for any Python int."""
+    return format(valor & 0xFFFFFFFF, '032b')
+
+
+def to_java_int(v: int) -> int:
     """
-    Generate a detailed execution log file by uploading instructions to the ALU service.
+    Reinterpret a Python int as a Java signed 32-bit integer.
 
-    This function serves as the main entry point for log generation. It orchestrates
-    the complete workflow:
-        1. File validation
-        2. HTTP upload to Spring Boot service
-        3. Response processing
-        4. Log file formatting and writing
-
-    The generated log file follows the MIC-1 specification format with:
-        - Initial register values (A=0xFFFFFFFF, B=0x00000001)
-        - Cycle-by-cycle state dumps
-        - Program counter progression
-        - Final End-of-Program (EOP) marker
-
-    Output Format Example:
-        b = 00000000000000000000000000000001
-        a = 11111111111111111111111111111111
-
-        Start of Program
-        ============================================================
-        Cycle 1
-
-        PC = 1
-        IR = 111100
-        b = 00000000000000000000000000000001
-        a = 11111111111111111111111111111111
-        s = 11111111111111111111111111111110
-        co = 0
-        ============================================================
-        Cycle 2
-        ...
-        Cycle 5
-
-        PC = 5
-        > Line is empty, EOP.
-
-    File Naming Convention:
-        Format: {base_name}_{YYYYMMDD_HHMMSS}.log
-        Example: etapa1_20231201_143025.log
-        Location: logs/ directory (created automatically)
-
-    Error Handling:
-        - Missing input file: Displays error and exits gracefully
-        - Connection refused: Guides user to start Spring Boot application
-        - HTTP error codes: Displays status and response body
-        - JSON parsing errors: Propagates with context
-
-    Args:
-        arquivo_entrada: Path to the input text file containing 6-bit binary
-                        instructions (one per line). Lines starting with '#'
-                        are treated as comments and ignored.
-
-    Returns:
-        None. Creates a .log file in the logs/ directory and prints status
-        messages to stdout. On error, prints error message without creating file.
-
-    Raises:
-        FileNotFoundError: Propagated if arquivo_entrada doesn't exist
-                           (handled internally with user message)
-        requests.exceptions.ConnectionError: If Spring Boot server is not running
-        KeyError: If unexpected JSON structure from API response
-        OSError: If unable to create logs/ directory or write log file
-
-    Example:
-        >>> gerar_log_com_upload("programa.txt")
-        📤 Enviando arquivo: programa.txt
-        ✅ Log gerado: logs/programa_20231201_143025.log
-           Total de ciclos: 42
-
-    See Also:
-        - ULA controller endpoint: POST /api/ula/executar-arquivo
-        - Service expects: Multipart file with field name 'arquivo'
-        - API response format: {"log": [...], "totalInstrucoes": N}
-    """
-
-    # Validate input file existence
-    if not os.path.exists(arquivo_entrada):
-        print(f"❌ Arquivo não encontrado: {arquivo_entrada}")
-        return
-
-    print(f"📤 Enviando arquivo: {arquivo_entrada}")
-
-    try:
-        # Perform HTTP multipart file upload to Spring Boot service
-        # The endpoint expects a file field named 'arquivo'
-        with open(arquivo_entrada, 'rb') as f:
-            files = {'arquivo': (os.path.basename(arquivo_entrada), f, 'text/plain')}
-            response = requests.post(
-                'http://localhost:8080/api/ula/executar-arquivo',
-                files=files,
-                timeout=30  # 30-second timeout for large programs
-            )
-
-        # Check for HTTP errors before processing
-        if response.status_code != 200:
-            print(f"❌ Erro HTTP: {response.status_code}")
-            print(response.text)
-            return
-
-        # Parse JSON response containing execution log
-        data: Dict[str, Any] = response.json()
-
-    except requests.exceptions.ConnectionError:
-        print("❌ Erro: Não foi possível conectar ao servidor Spring Boot")
-        print("   Certifique-se que a aplicação está rodando em http://localhost:8080")
-        return
-    except requests.exceptions.Timeout:
-        print("❌ Erro: Timeout ao aguardar resposta do servidor")
-        print("   O programa pode ser muito longo ou o servidor está sobrecarregado")
-        return
-    except ValueError as e:
-        print(f"❌ Erro ao parsear resposta JSON: {e}")
-        print("   Resposta recebida:", response.text[:200])
-        return
-    except Exception as e:
-        print(f"❌ Erro inesperado: {e}")
-        return
-
-    # Create logs directory if it doesn't exist
-    # Uses exist_ok=True to avoid race conditions in concurrent execution
-    logs_dir = "logs"
-    if not os.path.exists(logs_dir):
-        try:
-            os.makedirs(logs_dir)
-        except OSError as e:
-            print(f"❌ Erro ao criar diretório '{logs_dir}': {e}")
-            return
-
-    # Generate unique log filename with timestamp to prevent overwrites
-    nome_base = os.path.basename(arquivo_entrada).replace('.txt', '')
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    nome_saida = os.path.join(logs_dir, f"{nome_base}_{timestamp}.log")
-
-    def to_bin_32bits(valor: int) -> str:
-        """
-        Convert a 32-bit integer to its binary string representation.
-
-        This helper function ensures consistent 32-bit formatting by masking
-        the value to unsigned 32-bit range before conversion. This handles
-        Python's arbitrary-precision integers correctly.
-
-        Args:
-            valor: Signed or unsigned integer (will be masked to 32 bits)
-
-        Returns:
-            Zero-padded 32-character binary string (e.g., "00000000000000000000000000000001")
-
-        Examples:
-            >>> to_bin_32bits(1)
-            '00000000000000000000000000000001'
-            >>> to_bin_32bits(-1)
-            '11111111111111111111111111111111'
-            >>> to_bin_32bits(0xFFFFFFFF)
-            '11111111111111111111111111111111'
-        """
-        return format(valor & 0xFFFFFFFF, '032b')
-
-    # Write formatted log file with Windows line endings (CRLF) for compatibility
-    try:
-        with open(nome_saida, 'w', encoding='utf-8', newline='\r\n') as f:
-            # Write initial register state header
-            f.write(f"b = {to_bin_32bits(0x00000001)}\n")
-            f.write(f"a = {to_bin_32bits(0xFFFFFFFF)}\n")
-            f.write("\n")
-            f.write("Start of Program\n")
-            f.write("=" * 60 + "\n")
-
-            # Write execution cycle details for each instruction
-            # Each cycle includes: PC, IR, register values, ALU result, carry-out
-            for estado in data['log']:
-                f.write(f"Cycle {estado['pc']}\n")
-                f.write("\n")
-                f.write(f"PC = {estado['pc']}\n")
-                f.write(f"IR = {estado['irBin']}\n")
-                f.write(f"b = {to_bin_32bits(estado['b'])}\n")
-                f.write(f"a = {to_bin_32bits(estado['a'])}\n")
-                f.write(f"s = {to_bin_32bits(estado['s'])}\n")
-                f.write(f"co = {estado['vaiUm']}\n")
-                f.write("=" * 60 + "\n")
-
-            # Write end-of-program marker
-            # PC increments one beyond the last instruction
-            ultimo_ciclo = data['totalInstrucoes'] + 1
-            f.write(f"Cycle {ultimo_ciclo}\n")
-            f.write("\n")
-            f.write(f"PC = {ultimo_ciclo}\n")
-            f.write("> Line is empty, EOP.\n")
-            f.write("\n")
-
-    except IOError as e:
-        print(f"❌ Erro ao escrever arquivo de log: {e}")
-        return
-    except KeyError as e:
-        print(f"❌ Erro: Estrutura JSON inesperada - campo '{e}' não encontrado")
-        print("   Verifique se a API retornou o formato esperado")
-        return
-
-    # Display success message with file location and statistics
-    print(f"✅ Log gerado: {nome_saida}")
-    print(f"   Total de ciclos: {data['totalInstrucoes']}")
-
-
-if __name__ == "__main__":
-    """
-    Command-line interface for the log generator script.
-
-    Usage:
-        python3 gerar_log.py <arquivo.txt>
-
-    Arguments:
-        arquivo.txt: Path to the text file containing ALU instructions
-                    (one 6-bit binary instruction per line)
-
-    Exit Codes:
-        0: Success (log generated)
-        1: Error (invalid arguments, file not found, server unavailable, etc.)
-
-    Environment Requirements:
-        - Python 3.6 or higher
-        - requests library installed (pip install requests)
-        - Spring Boot application running on http://localhost:8080
+    Java's Integer range is [-2147483648, 2147483647].  Python's 0x80000000
+    equals 2147483648, which overflows Java Integer — so we mask to 32 bits
+    and apply two's-complement sign extension, exactly as Java would.
 
     Examples:
-        $ python3 gerar_log.py etapa1.txt
-        📤 Enviando arquivo: etapa1.txt
-        ✅ Log gerado: logs/etapa1_20231201_143025.log
-           Total de ciclos: 4
-
-        $ python3 gerar_log.py
-        Uso: python3 gerar_log.py <arquivo.txt>
-
-        $ python3 gerar_log.py inexistente.txt
-        ❌ Arquivo não encontrado: inexistente.txt
+        0x80000000  ->  -2147483648
+        0xFFFFFFFF  ->  -1
+        0x00000001  ->   1
     """
+    v = v & 0xFFFFFFFF
+    return v if v < 0x80000000 else v - 0x100000000
 
-    # Validate command line arguments
-    if len(sys.argv) < 2:
-        print("Uso: python3 gerar_log.py <arquivo.txt>")
-        print("\nDescrição:")
-        print("  Gera arquivo .log detalhado a partir de um arquivo de instruções")
-        print("  para a ULA IJVM, utilizando o serviço REST Spring Boot.")
-        print("\nArgumentos:")
-        print("  arquivo.txt  - Arquivo com instruções binárias de 6 bits")
-        print("\nExemplo:")
-        print("  python3 gerar_log.py etapa1.txt")
-        sys.exit(1)
 
-    # Execute main log generation function
-    gerar_log_com_upload(sys.argv[1])
+def detect_bit_width(arquivo: str) -> int:
+    """
+    Peek at the first valid instruction line in *arquivo* and return 6 or 8.
+    Returns 8 if the first line has 8 characters, 6 otherwise.
+    """
+    with open(arquivo, encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if line and not line.startswith('#'):
+                return 8 if len(line) >= 8 else 6
+    return 6
+
+
+def upload_program(arquivo: str, endpoint: str, extra_params: Dict = None) -> Optional[Dict[str, Any]]:
+    """
+    Upload *arquivo* to *endpoint* via multipart POST.
+
+    Register values (a, b) are sent as multipart form DATA fields so that
+    Spring Boot resolves them alongside MultipartFile without binding errors.
+    Values are converted to Java signed 32-bit range before serialisation to
+    avoid MethodArgumentTypeMismatchException (e.g. 0x80000000 -> -2147483648).
+    """
+    if not os.path.exists(arquivo):
+        print(f"Arquivo nao encontrado: {arquivo}")
+        return None
+
+    print(f"Enviando arquivo: {arquivo}  ->  {endpoint}")
+
+    try:
+        with open(arquivo, 'rb') as f:
+            files = {'arquivo': (os.path.basename(arquivo), f, 'text/plain')}
+
+            # Convert each value to Java-signed range BEFORE turning into a string.
+            # Without this, 0x80000000 becomes "2147483648" which overflows Integer.
+            data_fields = {
+                k: str(to_java_int(v))
+                for k, v in (extra_params or {}).items()
+            }
+
+            response = requests.post(
+                endpoint,
+                files=files,
+                data=data_fields,
+                timeout=30,
+            )
+
+        if response.status_code != 200:
+            print(f"Erro HTTP: {response.status_code}")
+            try:
+                body = response.json()
+                msg = body.get('message') or body.get('erro') or response.text
+            except Exception:
+                msg = response.text
+            print(f"   Detalhes: {msg}")
+            return None
+
+        return response.json()
+
+    except requests.exceptions.ConnectionError:
+        print("Nao foi possivel conectar ao servidor Spring Boot.")
+        print("   Certifique-se que a aplicacao esta rodando em http://localhost:8080")
+        return None
+    except requests.exceptions.Timeout:
+        print("Timeout ao aguardar resposta do servidor.")
+        return None
+    except ValueError as e:
+        print(f"Erro ao parsear JSON: {e}")
+        return None
+    except Exception as e:
+        print(f"Erro inesperado: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Log writers
+# ---------------------------------------------------------------------------
+
+def write_log_6bit(f, data: Dict[str, Any]) -> None:
+    """Write a 6-bit execution log in the original format."""
+    f.write(f"b = {to_bin_32bits(0x00000001)}\n")
+    f.write(f"a = {to_bin_32bits(0xFFFFFFFF)}\n")
+    f.write("\n")
+    f.write("Start of Program\n")
+    f.write("=" * 60 + "\n")
+
+    for estado in data['log']:
+        f.write(f"Cycle {estado['pc']}\n")
+        f.write("\n")
+        f.write(f"PC = {estado['pc']}\n")
+        f.write(f"IR = {estado['irBin']}\n")
+        f.write(f"b = {to_bin_32bits(estado['b'])}\n")
+        f.write(f"a = {to_bin_32bits(estado['a'])}\n")
+        f.write(f"s = {to_bin_32bits(estado['s'])}\n")
+        f.write(f"co = {estado['vaiUm']}\n")
+        f.write("=" * 60 + "\n")
+
+    ultimo_ciclo = data['totalInstrucoes'] + 1
+    f.write(f"Cycle {ultimo_ciclo}\n\n")
+    f.write(f"PC = {ultimo_ciclo}\n")
+    f.write("> Line is empty, EOP.\n\n")
+
+
+def write_log_8bit(f, data: Dict[str, Any]) -> None:
+    """
+    Write an 8-bit execution log in the extended format.
+
+    Normal cycle:
+        Cycle N
+        (blank line)
+        PC = N
+        IR = <8-bit bin>
+        b = <32-bit bin>
+        a = <32-bit bin>
+        s = <32-bit bin>
+        sd = <32-bit bin>
+        n = <0|1>
+        z = <0|1>
+        co = <0|1>
+
+    Invalid-signals cycle (SLL8=SRA1=1):
+        Cycle N
+        PC = N
+        IR = <8-bit bin>
+        > Error, invalid control signals.
+    """
+    initial_a = data.get('initialA', 0x80000000)
+    initial_b = data.get('initialB', 0x00000001)
+
+    f.write(f"b = {to_bin_32bits(initial_b)}\n")
+    f.write(f"a = {to_bin_32bits(initial_a)}\n")
+    f.write("\n")
+    f.write("Start of Program\n")
+    f.write("=" * 60 + "\n")
+
+    for estado in data['log']:
+        f.write(f"Cycle {estado['pc']}\n")
+
+        if estado.get('invalidSignals', False):
+            f.write(f"PC = {estado['pc']}\n")
+            f.write(f"IR = {estado['irBin']}\n")
+            f.write("> Error, invalid control signals.\n")
+        else:
+            f.write("\n")
+            f.write(f"PC = {estado['pc']}\n")
+            f.write(f"IR = {estado['irBin']}\n")
+            f.write(f"b = {to_bin_32bits(estado['b'])}\n")
+            f.write(f"a = {to_bin_32bits(estado['a'])}\n")
+            f.write(f"s = {to_bin_32bits(estado['s'])}\n")
+            f.write(f"sd = {to_bin_32bits(estado['sd'])}\n")
+            f.write(f"n = {estado['n']}\n")
+            f.write(f"z = {estado['z']}\n")
+            f.write(f"co = {estado['vaiUm']}\n")
+
+        f.write("=" * 60 + "\n")
+
+    ultimo_ciclo = data['totalInstrucoes'] + 1
+    f.write(f"Cycle {ultimo_ciclo}\n\n")
+    f.write(f"PC = {ultimo_ciclo}\n")
+    f.write("> Line is empty, EOP.\n\n")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def gerar_log(arquivo_entrada: str, bits: int, initial_a: int, initial_b: int) -> None:
+    """Full pipeline: upload -> parse -> write log file."""
+    base_url = "http://localhost:8080/api/ula"
+
+    if bits == 8:
+        endpoint = f"{base_url}/executar-arquivo8"
+        extra    = {"a": initial_a, "b": initial_b}
+    else:
+        endpoint = f"{base_url}/executar-arquivo"
+        extra    = {}
+
+    data = upload_program(arquivo_entrada, endpoint, extra)
+    if data is None:
+        return
+
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    nome_base  = os.path.splitext(os.path.basename(arquivo_entrada))[0]
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_saida = os.path.join(logs_dir, f"{nome_base}_{timestamp}.log")
+
+    try:
+        with open(nome_saida, 'w', encoding='utf-8', newline='\r\n') as f:
+            if bits == 8:
+                write_log_8bit(f, data)
+            else:
+                write_log_6bit(f, data)
+
+    except IOError as e:
+        print(f"Erro ao escrever arquivo de log: {e}")
+        return
+    except KeyError as e:
+        print(f"Estrutura JSON inesperada - campo '{e}' nao encontrado")
+        return
+
+    print(f"Log gerado: {nome_saida}")
+    print(f"   Modo: {bits}-bit  |  Total de ciclos: {data['totalInstrucoes']}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="MIC-1 ALU log generator (6-bit and 8-bit instruction sets)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 gerar_log.py programa_etapa1.txt
+  python3 gerar_log.py programa_etapa2_tarefa1.txt --bits 8
+  python3 gerar_log.py programa.txt --bits 8 --a -2147483648 --b 1
+        """
+    )
+    parser.add_argument("arquivo", help="Text file with binary instructions (one per line)")
+    parser.add_argument("--bits", type=int, choices=[6, 8], default=None,
+                        help="Instruction word width (default: auto-detect)")
+    parser.add_argument("--a", type=int, default=None,
+                        help="Initial A register value (default: 0xFFFFFFFF for 6-bit, 0x80000000 for 8-bit)")
+    parser.add_argument("--b", type=int, default=None,
+                        help="Initial B register value (default: 0x00000001)")
+
+    args = parser.parse_args()
+
+    if args.bits is None:
+        if not os.path.exists(args.arquivo):
+            print(f"Arquivo nao encontrado: {args.arquivo}")
+            sys.exit(1)
+        args.bits = detect_bit_width(args.arquivo)
+        print(f"Modo detectado automaticamente: {args.bits}-bit")
+
+    if args.a is None:
+        # Use to_java_int so 0x80000000 becomes -2147483648, not 2147483648
+        args.a = to_java_int(0x80000000) if args.bits == 8 else to_java_int(0xFFFFFFFF)
+    if args.b is None:
+        args.b = 0x00000001
+
+    gerar_log(args.arquivo, args.bits, args.a, args.b)
     sys.exit(0)
