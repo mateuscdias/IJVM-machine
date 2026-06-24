@@ -6,192 +6,177 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Service layer implementing the MIC-1 ALU (Arithmetic Logic Unit) logic.
+ * Service layer implementing the MIC-1 ALU logic, extended to support
+ * 8-bit control words with SLL8 and SRA1 shifter outputs, plus N and Z flags.
  *
- * <p>This service simulates the complete behavior of the MIC-1 ALU as described
- * in Tanenbaum's "Structured Computer Organization". It processes 6-bit
- * control words that determine ALU operations, bus enables, and carry handling.</p>
+ * <p><b>8-bit Instruction Format (X0..X7, MSB first):</b></p>
+ * <pre>
+ *   bit 7 (X0) - SLL8 - Shift Left Logical 8 bits on output S
+ *   bit 6 (X1) - SRA1 - Shift Right Arithmetic 1 bit on output S
+ *   bit 5 (X2) - F0   - ALU function selector (MSB)
+ *   bit 4 (X3) - F1   - ALU function selector (LSB)
+ *   bit 3 (X4) - ENA  - Enable A bus
+ *   bit 2 (X5) - ENB  - Enable B bus
+ *   bit 1 (X6) - INVA - Invert A bus
+ *   bit 0 (X7) - INC  - Carry-in
+ * </pre>
  *
- * <p><b>Instruction Format (6 bits - X0 X1 X2 X3 X4 X5)</b></p>
- * <ul>
- *   <li>bit 5 (X0) - F0 - ALU function selector (MSB)</li>
- *   <li>bit 4 (X1) - F1 - ALU function selector (LSB)</li>
- *   <li>bit 3 (X2) - ENA - Enable A bus (0 forces A=0)</li>
- *   <li>bit 2 (X3) - ENB - Enable B bus (0 forces B=0)</li>
- *   <li>bit 1 (X4) - INVA - Invert A bus (bitwise complement)</li>
- *   <li>bit 0 (X5) - INC - Carry-in to full adder (vem-um)</li>
- * </ul>
+ * <p><b>Constraint:</b> SLL8 and SRA1 must never both be 1; if they are,
+ * the instruction is flagged as invalid.</p>
  *
- * <p><b>ALU Operations (F0, F1 combination)</b></p>
- * <ul>
- *   <li>F0=0, F1=0 - A AND B - Bitwise logical AND</li>
- *   <li>F0=0, F1=1 - A OR B - Bitwise logical OR</li>
- *   <li>F0=1, F1=0 - NOT B - Bitwise complement of effective B</li>
- *   <li>F0=1, F1=1 - A + B - Arithmetic addition with carry-in</li>
- * </ul>
- *
- * <p><b>Processing Pipeline</b></p>
- * <ol>
- *   <li><b>Bus Enable:</b> A and B registers are forced to 0 if ENA/ENB = 0</li>
- *   <li><b>Invert A:</b> If INVA = 1, effective A is bitwise complemented</li>
- *   <li><b>Logic Unit:</b> Selected operation (AND/OR/NOT B/ADD) is performed</li>
- *   <li><b>Full Adder:</b> Logic unit output + INC (carry-in) gives final result</li>
- *   <li><b>Result Storage:</b> 32-bit result S and carry-out (vai-um) are stored</li>
- * </ol>
- *
- * <p><b>Note:</b> In Etapa 1 (Stage 1), there is no register file or feedback
- * between cycles. A and B remain constant throughout program execution.</p>
- *
+ * <p>6-bit instructions are still fully supported via the legacy API.</p>
+ * 
  * @author Miguel Mochizuki Silva
  * @author Mateus C. Dias
  * @author Joaquim Germano Félix
  * @author Gabriel Bringel Gonçalves
- * @version 1.0
- * @since 1.0
- * @see com.bisha.ijvm.model.EstadoULA
+ *
+ * @version 2.0
  */
+
 @Service
 public class UlaService {
-
+ 
+    public UlaService() {}
+ 
+    // -------------------------------------------------------------------------
+    // 6-bit legacy path (unchanged behaviour)
+    // -------------------------------------------------------------------------
+ 
     /**
-     * Default constructor for UlaService.
-     *
-     * <p>This constructor is used by Spring Framework for component instantiation
-     * and dependency injection. The service contains no external dependencies
-     * and is stateless, making it thread-safe for concurrent requests.</p>
-     */
-    public UlaService() {
-        // Default constructor required by Spring Framework
-    }
-
-    /**
-     * Processes a single MIC-1 ALU instruction.
-     *
-     * <p>This method implements the complete ALU microarchitecture including
-     * bus management, logic unit operations, and full adder with carry handling.
-     * All 32-bit values are treated as unsigned for arithmetic operations to
-     * properly handle overflow and carry generation.</p>
-     *
-     * <p><b>Processing Steps:</b></p>
-     * <ol>
-     *   <li>Extract control bits: F0, F1, ENA, ENB, INVA, INC from the 6-bit instruction</li>
-     *   <li>Apply bus enables: effA = (ENA==1) ? a : 0; effB = (ENB==1) ? b : 0</li>
-     *   <li>Apply inversion: if (INVA==1) effA = ~effA</li>
-     *   <li>Execute logic unit operation based on F0/F1:
-     *     <ul>
-     *       <li>00: AND - effA &amp; effB</li>
-     *       <li>01: OR - effA | effB</li>
-     *       <li>10: NOT B - ~effB</li>
-     *       <li>11: ADD - effA + effB</li>
-     *     </ul>
-     *   </li>
-     *   <li>Perform full addition with carry-in: result = logic_out + INC</li>
-     *   <li>Extract 32-bit result S and carry-out (vai-um)</li>
-     * </ol>
-     *
-     * <p><b>Important Implementation Details:</b></p>
-     * <ul>
-     *   <li>Long (64-bit) arithmetic prevents overflow during addition</li>
-     *   <li>Masking with 0xFFFFFFFFL ensures proper 32-bit unsigned handling</li>
-     *   <li>Carry-out is extracted from bit 32 of the 64-bit sum</li>
-     *   <li>INC (carry-in) affects all operations, not just addition</li>
-     * </ul>
-     *
-     * @param instrucao 6-bit control word as integer (0-63), typically parsed from binary string
-     * @param pc Program counter value for the current cycle (starting from 1)
-     * @param a Raw value on the A bus (32-bit signed integer, treated as unsigned for operations)
-     * @param b Raw value on the B bus (32-bit signed integer, treated as unsigned for operations)
-     * @return EstadoULA object containing complete execution state including:
-     *         effective A and B values, ALU result S, carry-out, and instruction metadata
-     * @throws IllegalArgumentException if instrucao is outside valid range (0-63)
-     * @see EstadoULA
+     * Processes a single 6-bit MIC-1 ALU instruction (legacy path).
      */
     public EstadoULA processarInstrucao(int instrucao, int pc, int a, int b) {
-
-        // Bit extraction (spec: F0 F1 ENA ENB INVA INC = X0...X5, MSB first)
-        int f0   = (instrucao >> 5) & 1;   // X0
-        int f1   = (instrucao >> 4) & 1;   // X1
-        int ena  = (instrucao >> 3) & 1;   // X2
-        int enb  = (instrucao >> 2) & 1;   // X3
-        int inva = (instrucao >> 1) & 1;   // X4
-        int inc  =  instrucao       & 1;   // X5
-
-        // Bus enables: drive to 0 when disabled
+ 
+        int f0   = (instrucao >> 5) & 1;
+        int f1   = (instrucao >> 4) & 1;
+        int ena  = (instrucao >> 3) & 1;
+        int enb  = (instrucao >> 2) & 1;
+        int inva = (instrucao >> 1) & 1;
+        int inc  =  instrucao       & 1;
+ 
         int effA = (ena == 1) ? a : 0;
         int effB = (enb == 1) ? b : 0;
-
-        // INVA: bitwise complement of A (after ENA)
         if (inva == 1) effA = ~effA;
-
-        // Logic unit: select one of three outputs
-        // (unsigned 32-bit value; masking prevents sign-extension artifacts)
+ 
         long logicOut;
-        if      (f0 == 0 && f1 == 0) logicOut = (effA & effB)  & 0xFFFFFFFFL;  // AND
-        else if (f0 == 0 && f1 == 1) logicOut = (effA | effB)  & 0xFFFFFFFFL;  // OR
-        else if (f0 == 1 && f1 == 0) logicOut = (~effB)        & 0xFFFFFFFFL;  // NOT B
-        else                          logicOut = (effA & 0xFFFFFFFFL)           // A + B
+        if      (f0 == 0 && f1 == 0) logicOut = (effA & effB)  & 0xFFFFFFFFL;
+        else if (f0 == 0 && f1 == 1) logicOut = (effA | effB)  & 0xFFFFFFFFL;
+        else if (f0 == 1 && f1 == 0) logicOut = (~effB)        & 0xFFFFFFFFL;
+        else                          logicOut = (effA & 0xFFFFFFFFL)
                                                + (effB & 0xFFFFFFFFL);
-
-        // Full adder: logic-unit output + carry-in (INC / vem-um)
+ 
         long soma = logicOut + inc;
-
-        int s      = (int)(soma          & 0xFFFFFFFFL);
-        int vaiUm  = (int)((soma >> 32)  & 1);
-
-        // effA/effB are logged because they are what the ALU actually operated on
+        int s     = (int)(soma         & 0xFFFFFFFFL);
+        int vaiUm = (int)((soma >> 32) & 1);
+ 
         return new EstadoULA(instrucao, pc, effA, effB, s, vaiUm);
     }
-
+ 
     /**
-     * Executes a complete sequence of MIC-1 instructions.
-     *
-     * <p>This method processes a list of binary instruction strings sequentially,
-     * maintaining a program counter (PC) that increments with each instruction.
-     * In Stage 1 (Etapa 1), there is no register feedback between cycles, so
-     * A and B remain constant throughout the entire program execution.</p>
-     *
-     * <p><b>Execution Flow:</b></p>
-     * <ol>
-     *   <li>Initialize program counter to 1</li>
-     *   <li>For each instruction in the list:
-     *     <ul>
-     *       <li>Parse binary string to integer (base 2)</li>
-     *       <li>Process instruction with current A, B, and PC values</li>
-     *       <li>Record execution state in log</li>
-     *       <li>Increment program counter</li>
-     *     </ul>
-     *   </li>
-     *   <li>Return complete execution log</li>
-     * </ol>
-     *
-     * <p><b>Input Validation:</b></p>
-     * <p>This method assumes all instruction strings are valid 6-bit binary
-     * strings. Invalid formats will throw {@link NumberFormatException}.</p>
-     *
-     * @param instrucoesBin List of 6-character binary strings (e.g., "111100"),
-     *                      each representing one ALU instruction
-     * @param initialA Initial value for the A register (32-bit, preserved throughout execution)
-     * @param initialB Initial value for the B register (32-bit, preserved throughout execution)
-     * @return List of EstadoULA objects representing the execution state after each instruction,
-     *         ordered by execution sequence
-     * @throws NumberFormatException if any binary string is invalid (not proper binary format)
-     * @throws NullPointerException if instrucoesBin is null
-     * @see #processarInstrucao(int, int, int, int)
+     * Executes a list of 6-bit binary instructions (legacy path).
      */
-    public List<EstadoULA> processarPrograma(
-            List<String> instrucoesBin,
-            int initialA,
-            int initialB) {
-
+    public List<EstadoULA> processarPrograma(List<String> instrucoesBin, int initialA, int initialB) {
         List<EstadoULA> log = new ArrayList<>();
         int pc = 1;
-
-        for (String instrucaoBin : instrucoesBin) {
-            int instrucao = Integer.parseInt(instrucaoBin, 2);
+        for (String bin : instrucoesBin) {
+            int instrucao = Integer.parseInt(bin, 2);
             log.add(processarInstrucao(instrucao, pc, initialA, initialB));
             pc++;
         }
-
+        return log;
+    }
+ 
+    // -------------------------------------------------------------------------
+    // 8-bit extended path
+    // -------------------------------------------------------------------------
+ 
+    /**
+     * Processes a single 8-bit MIC-1 ALU instruction.
+     *
+     * <p>Bit layout (MSB → LSB): SLL8 SRA1 F0 F1 ENA ENB INVA INC</p>
+     *
+     * <p>If SLL8 and SRA1 are both 1 the instruction is invalid and an
+     * {@link EstadoULA} with {@code invalidSignals=true} is returned;
+     * all other fields are set to 0 / the raw IR value.</p>
+     *
+     * @param instrucao 8-bit control word (0-255)
+     * @param pc        Program counter for this cycle (1-indexed)
+     * @param a         Raw A register value
+     * @param b         Raw B register value
+     * @return          Complete ALU state including Sd, N, Z
+     */
+    public EstadoULA processarInstrucao8(int instrucao, int pc, int a, int b) {
+ 
+        int sll8 = (instrucao >> 7) & 1;  // X0
+        int sra1 = (instrucao >> 6) & 1;  // X1
+        int f0   = (instrucao >> 5) & 1;  // X2
+        int f1   = (instrucao >> 4) & 1;  // X3
+        int ena  = (instrucao >> 3) & 1;  // X4
+        int enb  = (instrucao >> 2) & 1;  // X5
+        int inva = (instrucao >> 1) & 1;  // X6
+        int inc  =  instrucao       & 1;  // X7
+ 
+        // Constraint: SLL8 and SRA1 must not both be high
+        if (sll8 == 1 && sra1 == 1) {
+            return new EstadoULA(instrucao, pc, 0, 0, 0, 0, 0, 0, 0, true, true);
+        }
+ 
+        // Bus enables
+        int effA = (ena == 1) ? a : 0;
+        int effB = (enb == 1) ? b : 0;
+        if (inva == 1) effA = ~effA;
+ 
+        // Logic/arithmetic unit (same as 6-bit core)
+        long logicOut;
+        if      (f0 == 0 && f1 == 0) logicOut = (effA & effB)  & 0xFFFFFFFFL;
+        else if (f0 == 0 && f1 == 1) logicOut = (effA | effB)  & 0xFFFFFFFFL;
+        else if (f0 == 1 && f1 == 0) logicOut = (~effB)        & 0xFFFFFFFFL;
+        else                          logicOut = (effA & 0xFFFFFFFFL)
+                                               + (effB & 0xFFFFFFFFL);
+ 
+        // Full adder with carry-in
+        long soma = logicOut + inc;
+        int s     = (int)(soma         & 0xFFFFFFFFL);
+        int vaiUm = (int)((soma >> 32) & 1);
+ 
+        // Shifter stage (applied AFTER ALU output)
+        int sd;
+        if (sll8 == 1) {
+            // Logical left shift 8: lower 24 bits become upper, lower 8 filled with 0
+            sd = s << 8;
+        } else if (sra1 == 1) {
+            // Arithmetic right shift 1: MSB is replicated (sign-extension)
+            sd = s >> 1;
+        } else {
+            sd = s;
+        }
+ 
+        // Flags are computed on the SHIFTED output Sd
+        int n = (sd < 0)  ? 1 : 0;
+        int z = (sd == 0) ? 1 : 0;
+ 
+        return new EstadoULA(instrucao, pc, effA, effB, s, sd, vaiUm, n, z, true, false);
+    }
+ 
+    /**
+     * Executes a list of 8-bit binary instructions.
+     *
+     * @param instrucoesBin List of 8-character binary strings
+     * @param initialA      Initial A register value
+     * @param initialB      Initial B register value
+     * @return              Execution log
+     */
+    public List<EstadoULA> processarPrograma8(
+            List<String> instrucoesBin, int initialA, int initialB) {
+ 
+        List<EstadoULA> log = new ArrayList<>();
+        int pc = 1;
+        for (String bin : instrucoesBin) {
+            int instrucao = Integer.parseInt(bin, 2);
+            log.add(processarInstrucao8(instrucao, pc, initialA, initialB));
+            pc++;
+        }
         return log;
     }
 }
