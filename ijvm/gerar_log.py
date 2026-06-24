@@ -263,26 +263,173 @@ def gerar_log(arquivo_entrada: str, bits: int, initial_a: int, initial_b: int) -
 # CLI
 # ---------------------------------------------------------------------------
 
+
+# ===========================================================================
+# 21-bit MIC-1 log support
+# ===========================================================================
+
+_REG_ORDER = ['MAR', 'MDR', 'PC', 'MBR', 'SP', 'LV', 'CPP', 'TOS', 'OPC', 'H']
+_SEP = "=" * 53
+
+
+def upload_mic_program(arquivo_programa: str, arquivo_regs: str) -> Optional[Dict[str, Any]]:
+    """Upload program + register file to /api/mic/executar-arquivo."""
+    for f in [arquivo_programa, arquivo_regs]:
+        if not os.path.exists(f):
+            print(f"Arquivo nao encontrado: {f}")
+            return None
+
+    endpoint = "http://localhost:8080/api/mic/executar-arquivo"
+    print(f"Enviando programa:      {arquivo_programa}")
+    print(f"Enviando registradores: {arquivo_regs}")
+
+    try:
+        with open(arquivo_programa, 'rb') as fp, open(arquivo_regs, 'rb') as fr:
+            files = {
+                'programa':      (os.path.basename(arquivo_programa), fp, 'text/plain'),
+                'registradores': (os.path.basename(arquivo_regs),     fr, 'text/plain'),
+            }
+            response = requests.post(endpoint, files=files, timeout=30)
+
+        if response.status_code != 200:
+            print(f"Erro HTTP: {response.status_code}")
+            try:
+                body = response.json()
+                msg = body.get('message') or body.get('erro') or response.text
+            except Exception:
+                msg = response.text
+            print(f"   Detalhes: {msg}")
+            return None
+
+        return response.json()
+
+    except requests.exceptions.ConnectionError:
+        print("Nao foi possivel conectar ao servidor Spring Boot (http://localhost:8080)")
+        return None
+    except Exception as e:
+        print(f"Erro inesperado: {e}")
+        return None
+
+
+def _fmt_reg_mic(name: str, val: int) -> str:
+    """Format one register as 'name = <binary>' (MBR = 8 bits, others = 32 bits)."""
+    if name.upper() == 'MBR':
+        return f"{name.lower()} = {format(val & 0xFF, '08b')}"
+    return f"{name.lower()} = {format(val & 0xFFFFFFFF, '032b')}"
+
+
+def _fmt_regs_block_mic(regs: Dict[str, int]) -> list:
+    return [_fmt_reg_mic(name, regs[name]) for name in _REG_ORDER]
+
+
+def write_log_mic(f, data: Dict[str, Any]) -> None:
+    """Write a 21-bit MIC-1 execution log in the exact expected format."""
+    instructions = [c['ir'] for c in data['log']]
+
+    for instr in instructions:
+        f.write(instr + "\n")
+
+    f.write(_SEP + "\n")
+    f.write("> Initial register states\n")
+    if data['log']:
+        for line in _fmt_regs_block_mic(data['log'][0]['inicio']):
+            f.write(line + "\n")
+
+    f.write(_SEP + "\n")
+    f.write("Start of program\n")
+    f.write(_SEP + "\n")
+
+    last_ciclo = 0
+    for ciclo in data['log']:
+        last_ciclo = ciclo['ciclo']
+        ir = ciclo['ir']
+        ir_fmt = f"{ir[0:8]} {ir[8:17]} {ir[17:21]}"
+
+        f.write(f"Cycle {ciclo['ciclo']}\n")
+        f.write(f"ir = {ir_fmt}\n")
+        f.write(f"b_bus = {ciclo['busBRegistrador']}\n")
+        bus_c = ciclo['busCRegistradores']
+        f.write(f"c_bus = {', '.join(bus_c) if bus_c else '(none)'}\n")
+        f.write("> Registers before instruction\n")
+        for line in _fmt_regs_block_mic(ciclo['inicio']):
+            f.write(line + "\n")
+        f.write("> Registers after instruction\n")
+        for line in _fmt_regs_block_mic(ciclo['fim']):
+            f.write(line + "\n")
+        f.write(_SEP + "\n")
+
+    f.write(f"Cycle {last_ciclo}\n")
+    f.write("No more lines, EOP.\n\n")
+
+
+def gerar_log_mic(arquivo_programa: str, arquivo_regs: str) -> None:
+    """Full pipeline for 21-bit MIC-1 log generation."""
+    data = upload_mic_program(arquivo_programa, arquivo_regs)
+    if data is None:
+        return
+
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    nome_base  = os.path.splitext(os.path.basename(arquivo_programa))[0]
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_saida = os.path.join(logs_dir, f"{nome_base}_{timestamp}.log")
+
+    try:
+        with open(nome_saida, 'w', encoding='utf-8', newline='\r\n') as f:
+            write_log_mic(f, data)
+    except (IOError, KeyError) as e:
+        print(f"Erro ao escrever log: {e}")
+        return
+
+    print(f"Log gerado: {nome_saida}")
+    print(f"   Total de ciclos: {data['totalInstrucoes']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MIC-1 ALU log generator (6-bit and 8-bit instruction sets)",
+        description="MIC-1 ALU log generator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python3 gerar_log.py programa_etapa1.txt
-  python3 gerar_log.py programa_etapa2_tarefa1.txt --bits 8
-  python3 gerar_log.py programa.txt --bits 8 --a -2147483648 --b 1
+Modes:
+  6-bit / 8-bit ULA (single file):
+    python3 gerar_log.py programa.txt
+    python3 gerar_log.py programa.txt --bits 8
+    python3 gerar_log.py programa.txt --bits 8 --a -2147483648 --b 1
+
+  21-bit MIC-1 (program + register file):
+    python3 gerar_log.py --mic programa.txt registradores.txt
         """
     )
-    parser.add_argument("arquivo", help="Text file with binary instructions (one per line)")
+
+    parser.add_argument("arquivo",
+        help="Program file. For --mic mode this is the instruction file.")
+    parser.add_argument("registradores", nargs="?", default=None,
+        help="Register file (.txt). Required for --mic mode.")
+    parser.add_argument("--mic", action="store_true",
+        help="21-bit MIC-1 mode (requires a register file as second argument)")
     parser.add_argument("--bits", type=int, choices=[6, 8], default=None,
-                        help="Instruction word width (default: auto-detect)")
+        help="ULA instruction width (default: auto-detect). Ignored in --mic mode.")
     parser.add_argument("--a", type=int, default=None,
-                        help="Initial A register value (default: 0xFFFFFFFF for 6-bit, 0x80000000 for 8-bit)")
+        help="Initial A register value (ULA modes only).")
     parser.add_argument("--b", type=int, default=None,
-                        help="Initial B register value (default: 0x00000001)")
+        help="Initial B register value (ULA modes only).")
 
     args = parser.parse_args()
+
+    if args.mic:
+        if args.registradores is None:
+            print("Erro: --mic requer um arquivo de registradores como segundo argumento.")
+            print("  Uso: python3 gerar_log.py --mic programa.txt registradores.txt")
+            sys.exit(1)
+        if not os.path.exists(args.arquivo):
+            print(f"Arquivo nao encontrado: {args.arquivo}")
+            sys.exit(1)
+        if not os.path.exists(args.registradores):
+            print(f"Arquivo nao encontrado: {args.registradores}")
+            sys.exit(1)
+        gerar_log_mic(args.arquivo, args.registradores)
+        sys.exit(0)
 
     if args.bits is None:
         if not os.path.exists(args.arquivo):
@@ -292,7 +439,6 @@ Examples:
         print(f"Modo detectado automaticamente: {args.bits}-bit")
 
     if args.a is None:
-        # Use to_java_int so 0x80000000 becomes -2147483648, not 2147483648
         args.a = to_java_int(0x80000000) if args.bits == 8 else to_java_int(0xFFFFFFFF)
     if args.b is None:
         args.b = 0x00000001
