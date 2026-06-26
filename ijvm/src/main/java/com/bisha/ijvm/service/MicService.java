@@ -31,7 +31,26 @@ import java.util.List;
  * The 9-character substring str[8..16] is read left-to-right:
  * str[0]='1' enables H, str[1]='1' enables OPC, ..., str[8]='1' enables MAR.
  *
- * @version 2.0
+ * <h2>23-bit Instruction Format (stage 3, with data memory)</h2>
+ * <pre>
+ *   bits [0:8]   – ULA 8-bit control (same encoding as the 21-bit path)
+ *   bits [8:17]  – Bus C 9-bit selector (same as the 21-bit path)
+ *   bits [17:19] – Memory control, 2 bits, written WRITE READ:
+ *                    "00" no memory operation
+ *                    "01" READ  → MDR = mem[MAR]
+ *                    "10" WRITE → mem[MAR] = MDR
+ *                    "11" FETCH special case (see below)
+ *   bits [19:23] – Bus B 4-bit decoder value (same as the 21-bit path)
+ * </pre>
+ * The memory operation always runs AFTER the bus C write, using the MAR and
+ * MDR values already updated in the same cycle.
+ *
+ * <p>FETCH special case ("11"): the instruction does not go through the ULA and
+ * does not touch data memory. The high 8 bits (substring [0:8]) become the MBR,
+ * and H receives that MBR zero-extended to 32 bits (H = MBR). This is used by
+ * the BIPUSH instruction.</p>
+ *
+ * @version 3.0
  */
 @Service
 public class MicService {
