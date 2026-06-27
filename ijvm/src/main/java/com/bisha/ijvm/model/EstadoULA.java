@@ -48,11 +48,11 @@ public class EstadoULA {
         this.b = b;
         this.s = s;
         this.vaiUm = vaiUm;
-        this.n = 0;
-        this.z = 0;
+        this.n = (s < 0) ? 1 : 0;
+        this.z = (s == 0) ? 1 : 0;
         this.irWidth8 = false;
         this.invalidSignals = false;
-        this.sd = 0;
+        this.sd = s;
     }
     /*
     Full constructor for 8-bit instruction mode

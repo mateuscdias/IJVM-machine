@@ -76,11 +76,12 @@ public class MicService {
         switch (val) {
             case 0: return regs.getMdr();
             case 1: return regs.getPc();
-            case 2: // MBR zero-extended
-                return regs.getMbr() & 0xFF;
-            case 3: // MBRU sign-extended
+            case 2: // MBR sign-extended
                 int mbr = regs.getMbr() & 0xFF;
                 return (mbr & 0x80) != 0 ? (mbr | 0xFFFFFF00) : mbr;
+
+            case 3: // MBRU zero-extended
+                return regs.getMbr() & 0xFF;
             case 4: return regs.getSp();
             case 5: return regs.getLv();
             case 6: return regs.getCpp();
