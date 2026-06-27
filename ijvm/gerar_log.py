@@ -20,12 +20,76 @@ Author: Miguel Mochizuki Silva, Mateus C. Dias, Joaquim Germano Felix,
 Version: 2.2
 """
 
-import requests
 import sys
 import os
 import argparse
+import json
+import socket
+import urllib.error
+import urllib.request
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+class _SimpleResponse:
+    def __init__(self, status_code: int, body: bytes):
+        self.status_code = status_code
+        self.text = body.decode('utf-8', errors='replace')
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class _RequestsFallback:
+    class exceptions:
+        ConnectionError = urllib.error.URLError
+        Timeout = socket.timeout
+
+    @staticmethod
+    def post(endpoint: str, files: Dict, data: Dict = None, timeout: int = 30):
+        boundary = "----ijvm-" + uuid.uuid4().hex
+        body = bytearray()
+
+        for name, value in (data or {}).items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            body.extend(str(value).encode())
+            body.extend(b"\r\n")
+
+        for name, spec in files.items():
+            filename, fileobj, content_type = spec
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
+            body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+            body.extend(fileobj.read())
+            body.extend(b"\r\n")
+
+        body.extend(f"--{boundary}--\r\n".encode())
+
+        request = urllib.request.Request(
+            endpoint,
+            data=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return _SimpleResponse(response.getcode(), response.read())
+        except urllib.error.HTTPError as e:
+            return _SimpleResponse(e.code, e.read())
+
+
+if requests is None:
+    requests = _RequestsFallback()
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +450,121 @@ def gerar_log_mic(arquivo_programa: str, arquivo_regs: str) -> None:
     print(f"   Total de ciclos: {data['totalInstrucoes']}")
 
 
+# ===========================================================================
+# 23-bit MIC-1 log support
+# ===========================================================================
+
+def upload_mic23_program(
+        arquivo_programa: str, arquivo_regs: str, arquivo_memoria: str) -> Optional[Dict[str, Any]]:
+    """Upload program + register + memory files to /api/mic/executar-arquivo23."""
+    for f in [arquivo_programa, arquivo_regs, arquivo_memoria]:
+        if not os.path.exists(f):
+            print(f"Arquivo nao encontrado: {f}")
+            return None
+
+    endpoint = "http://localhost:8080/api/mic/executar-arquivo23"
+    print(f"Enviando programa:      {arquivo_programa}")
+    print(f"Enviando registradores: {arquivo_regs}")
+    print(f"Enviando memoria:       {arquivo_memoria}")
+
+    try:
+        with open(arquivo_programa, 'rb') as fp, \
+             open(arquivo_regs, 'rb') as fr, \
+             open(arquivo_memoria, 'rb') as fm:
+            files = {
+                'programa':      (os.path.basename(arquivo_programa), fp, 'text/plain'),
+                'registradores': (os.path.basename(arquivo_regs),     fr, 'text/plain'),
+                'memoria':       (os.path.basename(arquivo_memoria),  fm, 'text/plain'),
+            }
+            response = requests.post(endpoint, files=files, timeout=30)
+
+        if response.status_code != 200:
+            print(f"Erro HTTP: {response.status_code}")
+            try:
+                body = response.json()
+                msg = body.get('message') or body.get('erro') or response.text
+            except Exception:
+                msg = response.text
+            print(f"   Detalhes: {msg}")
+            return None
+
+        return response.json()
+
+    except requests.exceptions.ConnectionError:
+        print("Nao foi possivel conectar ao servidor Spring Boot (http://localhost:8080)")
+        return None
+    except Exception as e:
+        print(f"Erro inesperado: {e}")
+        return None
+
+
+def _write_star_block(f, title: str, lines: list) -> None:
+    f.write(title + "\n")
+    f.write("*" * 31 + "\n")
+    for line in lines:
+        f.write(line + "\n")
+
+
+def write_log_mic23(f, data: Dict[str, Any]) -> None:
+    """Write a 23-bit MIC-1 execution log compatible with the stage 3 example."""
+    f.write("=" * 60 + "\n")
+    _write_star_block(f, "Initial memory state", data['memoriaInicial'])
+    _write_star_block(f, "Initial register state",
+                      _fmt_regs_block_mic(data['registradoresIniciais']))
+    f.write("=" * 60 + "\n")
+    f.write("Start of Program\n")
+    f.write("=" * 60 + "\n")
+
+    last_ciclo = 0
+    for ciclo in data['log']:
+        last_ciclo = ciclo['ciclo']
+        ir = ciclo['ir']
+        ir_fmt = f"{ir[0:8]} {ir[8:17]} {ir[17:19]} {ir[19:23]}"
+
+        f.write(f"Cycle {ciclo['ciclo']}\n")
+        f.write(f"ir = {ir_fmt}\n")
+        f.write(f"b = {ciclo['busBRegistrador']}\n")
+        bus_c = ciclo['busCRegistradores']
+        f.write(f"c = {', '.join(bus_c) if bus_c else '(none)'}\n")
+        f.write("\n")
+        _write_star_block(f, "> Registers before instruction",
+                          _fmt_regs_block_mic(ciclo['inicio']))
+        f.write("\n")
+        _write_star_block(f, "> Registers after instruction",
+                          _fmt_regs_block_mic(ciclo['fim']))
+        f.write("\n")
+        _write_star_block(f, "> Memory after instruction", ciclo['memoriaFim'])
+        f.write("=" * 60 + "\n")
+
+    f.write(f"Cycle {last_ciclo + 1}\n")
+    f.write("No more lines, EOP.\n\n")
+
+
+def gerar_log_mic23(
+        arquivo_programa: str, arquivo_regs: str, arquivo_memoria: str) -> None:
+    """Full pipeline for 23-bit MIC-1 log generation."""
+    data = upload_mic23_program(arquivo_programa, arquivo_regs, arquivo_memoria)
+    if data is None:
+        return
+
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    nome_base = os.path.splitext(os.path.basename(arquivo_programa))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_saida = os.path.join(logs_dir, f"{nome_base}_mic23_{timestamp}.log")
+
+    try:
+        with open(nome_saida, 'w', encoding='utf-8', newline='\r\n') as f:
+            write_log_mic23(f, data)
+    except (IOError, KeyError) as e:
+        print(f"Erro ao escrever log: {e}")
+        return
+
+    print(f"Log gerado: {nome_saida}")
+    print(f"   Total de ciclos: {data['totalInstrucoes']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="MIC-1 ALU log generator",
@@ -399,15 +578,22 @@ Modes:
 
   21-bit MIC-1 (program + register file):
     python3 gerar_log.py --mic programa.txt registradores.txt
+
+  23-bit MIC-1 (program + register + memory file):
+    python3 gerar_log.py --mic23 microinstrucoes.txt registradores.txt dados.txt
         """
     )
 
     parser.add_argument("arquivo",
-        help="Program file. For --mic mode this is the instruction file.")
+        help="Program file. For --mic/--mic23 mode this is the instruction file.")
     parser.add_argument("registradores", nargs="?", default=None,
-        help="Register file (.txt). Required for --mic mode.")
+        help="Register file (.txt). Required for --mic and --mic23 modes.")
+    parser.add_argument("memoria", nargs="?", default=None,
+        help="Memory file (.txt). Required for --mic23 mode.")
     parser.add_argument("--mic", action="store_true",
         help="21-bit MIC-1 mode (requires a register file as second argument)")
+    parser.add_argument("--mic23", action="store_true",
+        help="23-bit MIC-1 mode (requires register and memory files)")
     parser.add_argument("--bits", type=int, choices=[6, 8], default=None,
         help="ULA instruction width (default: auto-detect). Ignored in --mic mode.")
     parser.add_argument("--a", type=int, default=None,
@@ -416,6 +602,22 @@ Modes:
         help="Initial B register value (ULA modes only).")
 
     args = parser.parse_args()
+
+    if args.mic and args.mic23:
+        print("Erro: use apenas um modo por vez (--mic ou --mic23).")
+        sys.exit(1)
+
+    if args.mic23:
+        if args.registradores is None or args.memoria is None:
+            print("Erro: --mic23 requer arquivos de registradores e memoria.")
+            print("  Uso: python3 gerar_log.py --mic23 programa.txt registradores.txt dados.txt")
+            sys.exit(1)
+        for f in [args.arquivo, args.registradores, args.memoria]:
+            if not os.path.exists(f):
+                print(f"Arquivo nao encontrado: {f}")
+                sys.exit(1)
+        gerar_log_mic23(args.arquivo, args.registradores, args.memoria)
+        sys.exit(0)
 
     if args.mic:
         if args.registradores is None:

@@ -1,6 +1,7 @@
 package com.bisha.ijvm.controller;
 
 import com.bisha.ijvm.model.EstadoCiclo;
+import com.bisha.ijvm.model.Memoria;
 import com.bisha.ijvm.model.Registradores;
 import com.bisha.ijvm.service.MicService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -125,6 +126,37 @@ public class MicController {
         }
     }
 
+    /**
+     * Executes a 23-bit MIC-1 program from instruction, register and memory files.
+     */
+    @PostMapping("/executar-arquivo23")
+    public ResponseEntity<Map<String, Object>> executarArquivo23(
+            @RequestParam("programa")      MultipartFile programaFile,
+            @RequestParam("registradores") MultipartFile registradoresFile,
+            @RequestParam("memoria")       MultipartFile memoriaFile) {
+        try {
+            List<String> instrucoes = readLines(programaFile);
+            if (instrucoes.isEmpty()) return badRequest("Arquivo de programa vazio");
+            validarInstrucoes(instrucoes, 23);
+
+            List<String> regLines = readLines(registradoresFile);
+            Registradores regs = parseRegistradoresLines(regLines);
+            Registradores regsIniciais = regs.copy();
+
+            List<String> memoriaLines = readLines(memoriaFile);
+            if (memoriaLines.isEmpty()) return badRequest("Arquivo de memória vazio");
+            validarMemoria(memoriaLines);
+            Memoria memoria = Memoria.carregar(memoriaLines);
+            List<String> memoriaInicial = memoria.snapshot();
+
+            List<EstadoCiclo> log = micService.executarPrograma23(instrucoes, regs, memoria);
+            return ResponseEntity.ok(buildResponse23(log, regsIniciais, memoriaInicial));
+
+        } catch (Exception e) {
+            return badRequest("Erro ao processar arquivos: " + e.getMessage());
+        }
+    }
+
     // =========================================================================
     // Private helpers
     // =========================================================================
@@ -136,6 +168,24 @@ public class MicController {
                     .map(String::trim)
                     .filter(l -> !l.isEmpty() && !l.startsWith("#"))
                     .collect(Collectors.toList());
+        }
+    }
+
+    private void validarInstrucoes(List<String> instrucoes, int tamanho) {
+        for (String instrucao : instrucoes) {
+            if (!instrucao.matches("[01]{" + tamanho + "}")) {
+                throw new IllegalArgumentException(
+                    "instrução inválida: esperado binário de " + tamanho + " bits");
+            }
+        }
+    }
+
+    private void validarMemoria(List<String> linhas) {
+        for (String linha : linhas) {
+            if (!linha.matches("[01]{32}")) {
+                throw new IllegalArgumentException(
+                    "memória inválida: esperado uma palavra binária de 32 bits por linha");
+            }
         }
     }
 
@@ -211,11 +261,25 @@ public class MicController {
             entry.put("sdHex",           String.format("%08X", c.getSd()));
             entry.put("inicio",          regsToMap(c.getInicio()));
             entry.put("fim",             regsToMap(c.getFim()));
+            if (c.getOperacaoMemoria() != null) {
+                entry.put("operacaoMemoria", c.getOperacaoMemoria());
+            }
+            if (c.getMemoriaFim() != null) {
+                entry.put("memoriaFim", c.getMemoriaFim());
+            }
             entries.add(entry);
         }
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("log",             entries);
         resp.put("totalInstrucoes", log.size());
+        return resp;
+    }
+
+    private Map<String, Object> buildResponse23(
+            List<EstadoCiclo> log, Registradores regsIniciais, List<String> memoriaInicial) {
+        Map<String, Object> resp = buildResponse(log);
+        resp.put("registradoresIniciais", regsToMap(regsIniciais));
+        resp.put("memoriaInicial", memoriaInicial);
         return resp;
     }
 
