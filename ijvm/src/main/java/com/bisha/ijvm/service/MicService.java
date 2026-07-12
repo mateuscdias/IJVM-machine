@@ -1,6 +1,8 @@
 package com.bisha.ijvm.service;
 
 import com.bisha.ijvm.model.EstadoCiclo;
+import com.bisha.ijvm.model.EstadoULA;
+import com.bisha.ijvm.model.Memoria;
 import com.bisha.ijvm.model.Registradores;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -22,16 +24,35 @@ import java.util.List;
  *
  * <h2>Bus B decoder (verified against reference output)</h2>
  * <pre>
- *   0=MDR  1=PC  2=MBR(zero-ext)  3=MBRU(sign-ext)
+ *   0=MDR  1=PC  2=MBR(sign-ext)  3=MBRU(zero-ext)
  *   4=SP   5=LV  6=CPP            7=OPC             8=TOS
  * </pre>
- * Note: MBR (2) is zero-extended; MBRU (3) is sign-extended.
+ * Note: MBR (2) is sign-extended; MBRU (3) is zero-extended.
  *
  * <h2>Bus C selector</h2>
  * The 9-character substring str[8..16] is read left-to-right:
  * str[0]='1' enables H, str[1]='1' enables OPC, ..., str[8]='1' enables MAR.
  *
- * @version 2.0
+ * <h2>23-bit Instruction Format (stage 3, with data memory)</h2>
+ * <pre>
+ *   bits [0:8]   – ULA 8-bit control (same encoding as the 21-bit path)
+ *   bits [8:17]  – Bus C 9-bit selector (same as the 21-bit path)
+ *   bits [17:19] – Memory control, 2 bits, written WRITE READ:
+ *                    "00" no memory operation
+ *                    "01" READ  → MDR = mem[MAR]
+ *                    "10" WRITE → mem[MAR] = MDR
+ *                    "11" FETCH special case (see below)
+ *   bits [19:23] – Bus B 4-bit decoder value (same as the 21-bit path)
+ * </pre>
+ * The memory operation always runs AFTER the bus C write, using the MAR and
+ * MDR values already updated in the same cycle.
+ *
+ * <p>FETCH special case ("11"): the instruction does not go through the ULA and
+ * does not touch data memory. The high 8 bits (substring [0:8]) become the MBR,
+ * and H receives that MBR zero-extended to 32 bits (H = MBR). This is used by
+ * the BIPUSH instruction.</p>
+ *
+ * @version 3.0
  */
 @Service
 public class MicService {
@@ -50,18 +71,19 @@ public class MicService {
     /**
      * Returns the 32-bit value driven onto bus B.
      *
-     * MBR  (value 2) → zero-extended to 32 bits.
-     * MBRU (value 3) → sign-extended to 32 bits.
+     * MBR  (value 2) -> sign-extended to 32 bits.
+     * MBRU (value 3) -> zero-extended to 32 bits.
      */
     public int decodeBusB(int val, Registradores regs) {
         switch (val) {
             case 0: return regs.getMdr();
             case 1: return regs.getPc();
-            case 2: // MBR zero-extended
-                return regs.getMbr() & 0xFF;
-            case 3: // MBRU sign-extended
+            case 2: // MBR sign-extended
                 int mbr = regs.getMbr() & 0xFF;
                 return (mbr & 0x80) != 0 ? (mbr | 0xFFFFFF00) : mbr;
+
+            case 3: // MBRU zero-extended
+                return regs.getMbr() & 0xFF;
             case 4: return regs.getSp();
             case 5: return regs.getLv();
             case 6: return regs.getCpp();
@@ -129,6 +151,8 @@ public class MicService {
      * @return cycle log
      */
     public EstadoCiclo executarInstrucao(String instrBin, int ciclo, Registradores regs) {
+        validarInstrucaoBinaria(instrBin, 21);
+
         String ulaCtrl  = instrBin.substring(0, 8);   // [0:7]
         String busCStr  = instrBin.substring(8, 17);  // [8:16] — H OPC TOS CPP LV SP PC MDR MAR
         int    busBVal  = Integer.parseInt(instrBin.substring(17, 21), 2);
@@ -158,6 +182,79 @@ public class MicService {
     }
 
     /**
+     * Executes one 23-bit stage 3 instruction, mutating registers and memory.
+     */
+    public EstadoCiclo executarInstrucao23(
+            String instrBin, int ciclo, Registradores regs, Memoria memoria) {
+
+        validarInstrucaoBinaria(instrBin, 23);
+
+        String ulaCtrl = instrBin.substring(0, 8);
+        String busCStr = instrBin.substring(8, 17);
+        String memCtrl = instrBin.substring(17, 19);
+        int busBVal = Integer.parseInt(instrBin.substring(19, 23), 2);
+
+        Registradores inicio = regs.copy();
+
+        if ("11".equals(memCtrl)) {
+            int literal = Integer.parseInt(ulaCtrl, 2);
+            regs.setMbr(literal);
+            regs.setH(literal);
+            Registradores fim = regs.copy();
+            return new EstadoCiclo(
+                ciclo,
+                instrBin,
+                inicio,
+                fim,
+                "(none)",
+                List.of(),
+                0,
+                memoria.snapshot(),
+                "fetch"
+            );
+        }
+
+        int ulaWord = Integer.parseInt(ulaCtrl, 2);
+        int aValue = regs.getH();
+        int bValue = decodeBusB(busBVal, regs);
+        String bName = busBName(busBVal);
+
+        EstadoULA aluState = ulaService.processarInstrucao8(ulaWord, ciclo, aValue, bValue);
+        int sd = aluState.getSd();
+        List<String> cNames = writeBusC(busCStr, sd, regs);
+
+        String operacaoMemoria;
+        switch (memCtrl) {
+            case "00":
+                operacaoMemoria = "none";
+                break;
+            case "01":
+                regs.setMdr(memoria.read(regs.getMar()));
+                operacaoMemoria = "read";
+                break;
+            case "10":
+                memoria.write(regs.getMar(), regs.getMdr());
+                operacaoMemoria = "write";
+                break;
+            default:
+                throw new IllegalArgumentException("Controle de memória inválido: " + memCtrl);
+        }
+
+        Registradores fim = regs.copy();
+        return new EstadoCiclo(
+            ciclo,
+            instrBin,
+            inicio,
+            fim,
+            bName,
+            cNames,
+            sd,
+            memoria.snapshot(),
+            operacaoMemoria
+        );
+    }
+
+    /**
      * Executes a full program, mutating {@code regs} across cycles.
      */
     public List<EstadoCiclo> executarPrograma(List<String> instrucoesBin, Registradores regs) {
@@ -167,5 +264,25 @@ public class MicService {
             log.add(executarInstrucao(bin, ciclo++, regs));
         }
         return log;
+    }
+
+    /**
+     * Executes a full 23-bit program, mutating registers and memory across cycles.
+     */
+    public List<EstadoCiclo> executarPrograma23(
+            List<String> instrucoesBin, Registradores regs, Memoria memoria) {
+        List<EstadoCiclo> log = new ArrayList<>();
+        int ciclo = 1;
+        for (String bin : instrucoesBin) {
+            log.add(executarInstrucao23(bin, ciclo++, regs, memoria));
+        }
+        return log;
+    }
+
+    private void validarInstrucaoBinaria(String instrBin, int tamanho) {
+        if (instrBin == null || !instrBin.matches("[01]{" + tamanho + "}")) {
+            throw new IllegalArgumentException(
+                "Instrução MIC inválida: esperado binário de " + tamanho + " bits");
+        }
     }
 }

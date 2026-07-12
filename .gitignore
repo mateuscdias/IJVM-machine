@@ -32,3 +32,6 @@ replay_pid*
 # ==============================
 
 .vscode/
+
+# Codex/Superpowers worktrees
+.worktrees/
