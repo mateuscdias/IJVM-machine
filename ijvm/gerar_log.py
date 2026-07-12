@@ -10,14 +10,20 @@ Usage:
     python3 gerar_log.py <arquivo.txt> --bits 6      # force 6-bit mode
     python3 gerar_log.py <arquivo.txt> --bits 8      # force 8-bit mode
     python3 gerar_log.py <arquivo.txt> --bits 8 --a -2147483648 --b 1
+    python3 gerar_log.py --mic <programa.txt> <registradores.txt>
+    python3 gerar_log.py --mic23 <microinstrucoes.txt> <registradores.txt> <dados.txt>
+    python3 gerar_log.py --ijvm <instrucoes.txt> <registradores.txt> <dados.txt>
 
 Bit-width auto-detection:
     If the first valid instruction line is 8 characters long -> 8-bit mode.
     If it is 6 characters long -> 6-bit mode.
 
+In --ijvm mode the memory is printed once per high-level instruction, while the
+registers are still shown before and after every microinstruction.
+
 Author: Miguel Mochizuki Silva, Mateus C. Dias, Joaquim Germano Felix,
         Gabriel Bringel Goncalves
-Version: 2.2
+Version: 2.3
 """
 
 import sys
@@ -565,6 +571,148 @@ def gerar_log_mic23(
     print(f"   Total de ciclos: {data['totalInstrucoes']}")
 
 
+# ===========================================================================
+# IJVM log support (high-level instructions)
+# ===========================================================================
+
+def upload_ijvm_program(
+        arquivo_instrucoes: str, arquivo_regs: str, arquivo_memoria: str) -> Optional[Dict[str, Any]]:
+    """Upload instruction + register + memory files to /api/mic/executar-ijvm."""
+    for f in [arquivo_instrucoes, arquivo_regs, arquivo_memoria]:
+        if not os.path.exists(f):
+            print(f"Arquivo nao encontrado: {f}")
+            return None
+
+    endpoint = "http://localhost:8080/api/mic/executar-ijvm"
+    print(f"Enviando instrucoes:    {arquivo_instrucoes}")
+    print(f"Enviando registradores: {arquivo_regs}")
+    print(f"Enviando memoria:       {arquivo_memoria}")
+
+    try:
+        with open(arquivo_instrucoes, 'rb') as fi, \
+             open(arquivo_regs, 'rb') as fr, \
+             open(arquivo_memoria, 'rb') as fm:
+            files = {
+                'instrucoes':    (os.path.basename(arquivo_instrucoes), fi, 'text/plain'),
+                'registradores': (os.path.basename(arquivo_regs),       fr, 'text/plain'),
+                'memoria':       (os.path.basename(arquivo_memoria),    fm, 'text/plain'),
+            }
+            response = requests.post(endpoint, files=files, timeout=30)
+
+        if response.status_code != 200:
+            print(f"Erro HTTP: {response.status_code}")
+            try:
+                body = response.json()
+                msg = body.get('message') or body.get('erro') or response.text
+            except Exception:
+                msg = response.text
+            print(f"   Detalhes: {msg}")
+            return None
+
+        return response.json()
+
+    except requests.exceptions.ConnectionError:
+        print("Nao foi possivel conectar ao servidor Spring Boot (http://localhost:8080)")
+        return None
+    except Exception as e:
+        print(f"Erro inesperado: {e}")
+        return None
+
+
+def _write_cycle_ijvm(f, ciclo: Dict[str, Any]) -> None:
+    """
+    Write one microinstruction cycle: the 23-bit IR split into its four fields,
+    the bus B source, the bus C destinations and the registers before and after.
+
+    A fetch cycle (memory bits = 11) bypasses the ULA and writes nothing through
+    bus C, so both buses are reported as '-' and the cycle is marked as a fetch.
+    """
+    ir = ciclo['ir']
+    ir_fmt = f"{ir[0:8]} {ir[8:17]} {ir[17:19]} {ir[19:23]}"
+
+    f.write(f"Cycle {ciclo['ciclo']}\n")
+    f.write(f"ir = {ir_fmt}\n")
+
+    if ciclo.get('operacaoMemoria') == 'fetch':
+        f.write("b = -\n")
+        f.write("c = - (fetch)\n")
+    else:
+        f.write(f"b = {ciclo['busBRegistrador']}\n")
+        bus_c = ciclo['busCRegistradores']
+        f.write(f"c = {', '.join(bus_c) if bus_c else '(none)'}\n")
+
+    f.write("\n")
+    _write_star_block(f, "> Registers before instruction",
+                      _fmt_regs_block_mic(ciclo['inicio']))
+    f.write("\n")
+    _write_star_block(f, "> Registers after instruction",
+                      _fmt_regs_block_mic(ciclo['fim']))
+
+
+def write_log_ijvm(f, data: Dict[str, Any]) -> None:
+    """
+    Write an IJVM execution log.
+
+    Registers are shown before and after every microinstruction, while the data
+    memory is printed once per high-level instruction — that is the difference
+    from the 23-bit log of task 1, which prints memory on every cycle. Cycle
+    numbering is continuous across the whole program.
+    """
+    f.write("=" * 60 + "\n")
+    _write_star_block(f, "Initial memory state", data['memoriaInicial'])
+    f.write("*" * 31 + "\n")
+    _write_star_block(f, "Initial register state",
+                      _fmt_regs_block_mic(data['registradoresIniciais']))
+    f.write("=" * 60 + "\n")
+    f.write("Start of Program\n")
+    f.write("=" * 60 + "\n")
+
+    for bloco in data['blocos']:
+        instrucao = bloco['instrucao']
+
+        f.write(f"Instruction: {instrucao}\n")
+        f.write("=" * 60 + "\n")
+
+        for i, ciclo in enumerate(bloco['ciclos']):
+            if i:
+                f.write("-" * 60 + "\n")
+            _write_cycle_ijvm(f, ciclo)
+
+        f.write("=" * 60 + "\n")
+        _write_star_block(f, f"> Memory after instruction {instrucao}",
+                          bloco['memoriaApos'])
+        f.write("=" * 60 + "\n")
+
+    f.write(_SEP + "\n")
+    f.write("End of Program, EOP.\n")
+
+
+def gerar_log_ijvm(
+        arquivo_instrucoes: str, arquivo_regs: str, arquivo_memoria: str) -> None:
+    """Full pipeline for IJVM log generation."""
+    data = upload_ijvm_program(arquivo_instrucoes, arquivo_regs, arquivo_memoria)
+    if data is None:
+        return
+
+    logs_dir = "logs"
+    os.makedirs(logs_dir, exist_ok=True)
+
+    nome_base = os.path.splitext(os.path.basename(arquivo_instrucoes))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_saida = os.path.join(logs_dir, f"{nome_base}_ijvm_{timestamp}.log")
+
+    try:
+        with open(nome_saida, 'w', encoding='utf-8', newline='\r\n') as f:
+            write_log_ijvm(f, data)
+    except (IOError, KeyError) as e:
+        print(f"Erro ao escrever log: {e}")
+        return
+
+    print(f"Log gerado: {nome_saida}")
+    print(f"   Instrucoes IJVM: {data['totalInstrucoes']}"
+          f"  |  Total de ciclos: {data['totalCiclos']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="MIC-1 ALU log generator",
@@ -581,19 +729,24 @@ Modes:
 
   23-bit MIC-1 (program + register + memory file):
     python3 gerar_log.py --mic23 microinstrucoes.txt registradores.txt dados.txt
+
+  IJVM (high-level instructions + register + memory file):
+    python3 gerar_log.py --ijvm instrucoes.txt registradores.txt dados.txt
         """
     )
 
     parser.add_argument("arquivo",
-        help="Program file. For --mic/--mic23 mode this is the instruction file.")
+        help="Program file. For --mic/--mic23/--ijvm mode this is the instruction file.")
     parser.add_argument("registradores", nargs="?", default=None,
-        help="Register file (.txt). Required for --mic and --mic23 modes.")
+        help="Register file (.txt). Required for --mic, --mic23 and --ijvm modes.")
     parser.add_argument("memoria", nargs="?", default=None,
-        help="Memory file (.txt). Required for --mic23 mode.")
+        help="Memory file (.txt). Required for --mic23 and --ijvm modes.")
     parser.add_argument("--mic", action="store_true",
         help="21-bit MIC-1 mode (requires a register file as second argument)")
     parser.add_argument("--mic23", action="store_true",
         help="23-bit MIC-1 mode (requires register and memory files)")
+    parser.add_argument("--ijvm", action="store_true",
+        help="IJVM mode: ILOAD/DUP/BIPUSH (requires register and memory files)")
     parser.add_argument("--bits", type=int, choices=[6, 8], default=None,
         help="ULA instruction width (default: auto-detect). Ignored in --mic mode.")
     parser.add_argument("--a", type=int, default=None,
@@ -603,9 +756,21 @@ Modes:
 
     args = parser.parse_args()
 
-    if args.mic and args.mic23:
-        print("Erro: use apenas um modo por vez (--mic ou --mic23).")
+    if sum([args.mic, args.mic23, args.ijvm]) > 1:
+        print("Erro: use apenas um modo por vez (--mic, --mic23 ou --ijvm).")
         sys.exit(1)
+
+    if args.ijvm:
+        if args.registradores is None or args.memoria is None:
+            print("Erro: --ijvm requer arquivos de registradores e memoria.")
+            print("  Uso: python3 gerar_log.py --ijvm instrucoes.txt registradores.txt dados.txt")
+            sys.exit(1)
+        for f in [args.arquivo, args.registradores, args.memoria]:
+            if not os.path.exists(f):
+                print(f"Arquivo nao encontrado: {f}")
+                sys.exit(1)
+        gerar_log_ijvm(args.arquivo, args.registradores, args.memoria)
+        sys.exit(0)
 
     if args.mic23:
         if args.registradores is None or args.memoria is None:

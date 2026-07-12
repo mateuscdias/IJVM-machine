@@ -1,9 +1,11 @@
 package com.bisha.ijvm.controller;
 
+import com.bisha.ijvm.model.BlocoInstrucao;
 import com.bisha.ijvm.model.EstadoCiclo;
 import com.bisha.ijvm.model.Memoria;
 import com.bisha.ijvm.model.Registradores;
 import com.bisha.ijvm.service.MicService;
+import com.bisha.ijvm.service.TradutorService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -16,12 +18,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * REST Controller for MIC-1 21-bit instruction execution.
+ * REST Controller for MIC-1 instruction execution.
  *
  * <h2>Endpoints</h2>
  * <ul>
- *   <li>POST /api/mic/executar         – JSON payload (instructions + registers)</li>
- *   <li>POST /api/mic/executar-arquivo – multipart: program file + register file</li>
+ *   <li>POST /api/mic/executar           – JSON payload (21-bit instructions + registers)</li>
+ *   <li>POST /api/mic/executar-arquivo   – multipart: 21-bit program file + register file</li>
+ *   <li>POST /api/mic/executar-arquivo23 – multipart: 23-bit program file + register file + memory file</li>
+ *   <li>POST /api/mic/executar-ijvm      – multipart: IJVM instruction file + register file + memory file</li>
  * </ul>
  *
  * <h2>Register file format (plain text)</h2>
@@ -52,6 +56,9 @@ public class MicController {
 
     @Autowired
     private MicService micService;
+
+    @Autowired
+    private TradutorService tradutorService;
 
     public MicController() {}
 
@@ -157,6 +164,57 @@ public class MicController {
         }
     }
 
+    /**
+     * Translates an IJVM program and executes it on the MIC-1, from three
+     * uploaded text files.
+     *
+     * <p>The {@code instrucoes} file contains one IJVM instruction per line
+     * ({@code ILOAD x}, {@code DUP} or {@code BIPUSH byte}). The
+     * {@code registradores} file contains register initialisations
+     * ({@code NOME=value}, one per line) and the {@code memoria} file one 32-bit
+     * binary word per line. All three ignore blank lines and lines starting with
+     * {@code #}.</p>
+     *
+     * <p>The response carries the initial memory, the initial registers and one
+     * block per IJVM instruction. Each block holds the cycles of the
+     * microinstructions that implement it and the data memory as it stood once
+     * that instruction finished, which is what the deliverable log prints.</p>
+     *
+     * <pre>
+     * curl -F "instrucoes=@instruções.txt" \
+     *      -F "registradores=@registradores_etapa3_atualizado.txt" \
+     *      -F "memoria=@dados_etapa3_atualizado.txt" \
+     *      http://localhost:8080/api/mic/executar-ijvm
+     * </pre>
+     */
+    @PostMapping("/executar-ijvm")
+    public ResponseEntity<Map<String, Object>> executarIjvm(
+            @RequestParam("instrucoes")    MultipartFile instrucoesFile,
+            @RequestParam("registradores") MultipartFile registradoresFile,
+            @RequestParam("memoria")       MultipartFile memoriaFile) {
+        try {
+            List<String> instrucoes = readLines(instrucoesFile);
+            if (instrucoes.isEmpty()) return badRequest("Arquivo de instruções vazio");
+
+            List<String> regLines = readLines(registradoresFile);
+            Registradores regs = parseRegistradoresLines(regLines);
+            Registradores regsIniciais = regs.copy();
+
+            List<String> memoriaLines = readLines(memoriaFile);
+            if (memoriaLines.isEmpty()) return badRequest("Arquivo de memória vazio");
+            validarMemoria(memoriaLines);
+            Memoria memoria = Memoria.carregar(memoriaLines);
+            List<String> memoriaInicial = memoria.snapshot();
+
+            List<BlocoInstrucao> blocos =
+                tradutorService.montarEExecutarBlocos(instrucoes, regs, memoria);
+            return ResponseEntity.ok(buildResponseIjvm(blocos, regsIniciais, memoriaInicial));
+
+        } catch (Exception e) {
+            return badRequest("Erro ao processar arquivos: " + e.getMessage());
+        }
+    }
+
     // =========================================================================
     // Private helpers
     // =========================================================================
@@ -249,25 +307,36 @@ public class MicController {
         return m;
     }
 
+    /**
+     * Converts one cycle to a JSON-serialisable map.
+     *
+     * @param incluirMemoriaFim whether to carry the per-cycle memory snapshot;
+     *                          the IJVM log reports memory once per high-level
+     *                          instruction, so it does not need it per cycle
+     */
+    private Map<String, Object> cicloToMap(EstadoCiclo c, boolean incluirMemoriaFim) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("ciclo",           c.getCiclo());
+        entry.put("ir",              c.getIr());
+        entry.put("busBRegistrador", c.getBusBRegistrador());
+        entry.put("busCRegistradores", c.getBusCRegistradores());
+        entry.put("sd",              c.getSd());
+        entry.put("sdHex",           String.format("%08X", c.getSd()));
+        entry.put("inicio",          regsToMap(c.getInicio()));
+        entry.put("fim",             regsToMap(c.getFim()));
+        if (c.getOperacaoMemoria() != null) {
+            entry.put("operacaoMemoria", c.getOperacaoMemoria());
+        }
+        if (incluirMemoriaFim && c.getMemoriaFim() != null) {
+            entry.put("memoriaFim", c.getMemoriaFim());
+        }
+        return entry;
+    }
+
     private Map<String, Object> buildResponse(List<EstadoCiclo> log) {
         List<Map<String, Object>> entries = new ArrayList<>();
         for (EstadoCiclo c : log) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("ciclo",           c.getCiclo());
-            entry.put("ir",              c.getIr());
-            entry.put("busBRegistrador", c.getBusBRegistrador());
-            entry.put("busCRegistradores", c.getBusCRegistradores());
-            entry.put("sd",              c.getSd());
-            entry.put("sdHex",           String.format("%08X", c.getSd()));
-            entry.put("inicio",          regsToMap(c.getInicio()));
-            entry.put("fim",             regsToMap(c.getFim()));
-            if (c.getOperacaoMemoria() != null) {
-                entry.put("operacaoMemoria", c.getOperacaoMemoria());
-            }
-            if (c.getMemoriaFim() != null) {
-                entry.put("memoriaFim", c.getMemoriaFim());
-            }
-            entries.add(entry);
+            entries.add(cicloToMap(c, true));
         }
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("log",             entries);
@@ -280,6 +349,37 @@ public class MicController {
         Map<String, Object> resp = buildResponse(log);
         resp.put("registradoresIniciais", regsToMap(regsIniciais));
         resp.put("memoriaInicial", memoriaInicial);
+        return resp;
+    }
+
+    /**
+     * Builds the IJVM response: the initial state plus one block per high-level
+     * instruction, each carrying its cycles and the memory left behind by that
+     * instruction.
+     */
+    private Map<String, Object> buildResponseIjvm(
+            List<BlocoInstrucao> blocos, Registradores regsIniciais, List<String> memoriaInicial) {
+        List<Map<String, Object>> entries = new ArrayList<>();
+        int totalCiclos = 0;
+        for (BlocoInstrucao b : blocos) {
+            List<Map<String, Object>> ciclos = new ArrayList<>();
+            for (EstadoCiclo c : b.getCiclos()) {
+                ciclos.add(cicloToMap(c, false));
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("instrucao",   b.getInstrucao());
+            entry.put("ciclos",      ciclos);
+            entry.put("memoriaApos", b.getMemoriaApos());
+            entries.add(entry);
+            totalCiclos += b.totalCiclos();
+        }
+
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("memoriaInicial",        memoriaInicial);
+        resp.put("registradoresIniciais", regsToMap(regsIniciais));
+        resp.put("blocos",                entries);
+        resp.put("totalInstrucoes",       blocos.size());
+        resp.put("totalCiclos",           totalCiclos);
         return resp;
     }
 
