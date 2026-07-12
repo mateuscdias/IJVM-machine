@@ -20,14 +20,17 @@ src/main/java/com/bisha/ijvm/
 ├── UlaApplication.java
 ├── controller/
 │   ├── UlaController.java      # ALU endpoints (6-bit and 8-bit)
-│   └── MicController.java      # MIC-1 datapath endpoints (21-bit)
+│   └── MicController.java      # Endpoints MIC-1 de 21/23 bits e IJVM
 ├── model/
+│   ├── BlocoInstrucao.java      # Ciclos agrupados por instrução IJVM
 │   ├── EstadoULA.java          # ALU cycle state (single instruction)
 │   ├── EstadoCiclo.java        # MIC-1 cycle state (single instruction)
+│   ├── Memoria.java            # Memória de dados em palavras de 32 bits
 │   └── Registradores.java      # MIC-1 register file
 └── service/
     ├── UlaService.java         # ALU execution logic
-    └── MicService.java         # MIC-1 datapath execution logic
+    ├── MicService.java         # MIC-1 datapath and memory execution
+    └── TradutorService.java    # Tradução de ILOAD, DUP e BIPUSH
 
 gerar_log.py                    # Log generation utility (all modes)
 ```
@@ -205,8 +208,8 @@ Adds the full MIC-1 register file and connects it to the ALU via bus B (decoder)
 |-------|----------|-----------|
 | 0 | MDR | — |
 | 1 | PC | — |
-| 2 | MBR | Zero-extended to 32 bits |
-| 3 | MBRU | Sign-extended to 32 bits |
+| 2 | MBR | Sign-extended to 32 bits |
+| 3 | MBRU | Zero-extended to 32 bits |
 | 4 | SP | — |
 | 5 | LV | — |
 | 6 | CPP | — |
@@ -290,6 +293,75 @@ curl -F "programa=@programa_etapa2_tarefa2.txt" \
 
 ---
 
+## Stage 3 - Data Memory (23-bit)
+
+Stage 3 adds a two-bit memory-control field between buses C and B:
+
+```
+[  0 : 7  ]  [  8 : 16  ]  [17:18]  [ 19 : 22 ]
+  8-bit ALU   9-bit Bus C    Memory    4-bit Bus B
+```
+
+| Memory bits | Operation |
+|-------------|-----------|
+| `00` | No memory operation |
+| `01` | `READ`: `MDR = memory[MAR]` |
+| `10` | `WRITE`: `memory[MAR] = MDR` |
+| `11` | Special `fetch` used by `BIPUSH` |
+
+Bus C is written before the memory operation. Therefore, `READ` and `WRITE`
+observe the new values of MAR and MDR when those registers are selected in the
+same microinstruction. Data memory is loaded from a text file containing one
+32-bit binary word per line.
+
+The `fetch` case bypasses the ALU and data memory. Its first eight bits are
+copied to MBR and zero-extended into H.
+
+### Endpoint
+
+```bash
+curl -F "programa=@microinstruções_etapa3_tarefa1.txt" \
+     -F "registradores=@registradores_etapa3_tarefa1.txt" \
+     -F "memoria=@dados_etapa3_tarefa1.txt" \
+     http://localhost:8080/api/mic/executar-arquivo23
+```
+
+The response includes the initial state and, for every microinstruction, the
+register snapshots before and after execution, buses B and C, memory operation,
+and resulting memory snapshot.
+
+---
+
+## Final Deliverable - IJVM Translation
+
+The final endpoint reads and executes these high-level IJVM instructions:
+
+| Instruction | Translation |
+|-------------|-------------|
+| `ILOAD x` | `H=LV`; repeat `H=H+1` x times; `MAR=H;rd`; `MAR=SP=SP+1;wr`; `TOS=MDR` |
+| `DUP` | `MAR=SP=SP+1`; `MDR=TOS;wr` |
+| `BIPUSH byte` | `MAR=SP=SP+1`; dynamic `fetch`; `MDR=TOS=H;wr` |
+
+`ILOAD` accepts a non-negative decimal index. `BIPUSH` accepts exactly eight
+binary digits. The execution result is grouped by IJVM instruction, while cycle
+numbers remain continuous across the entire program. Each group contains the
+microinstruction cycles and the memory state after the IJVM instruction.
+
+### Endpoint
+
+```bash
+curl -F "instrucoes=@instruções.txt" \
+     -F "registradores=@registradores_etapa3_atualizado.txt" \
+     -F "memoria=@dados_etapa3_atualizado.txt" \
+     http://localhost:8080/api/mic/executar-ijvm
+```
+
+The supplied memory must contain every address reached by MAR. For the complete
+example beginning with `SP = 7`, the included `dados_etapa3_atualizado.txt` has
+16 words so the stack can grow to addresses 8, 9 and 10.
+
+---
+
 ## Log Generator (`gerar_log.py`)
 
 A Python utility that calls the REST API and writes a formatted `.log` file.
@@ -317,6 +389,20 @@ python3 gerar_log.py programa_etapa2_tarefa1.txt --bits 8 --a -2147483648 --b 1
 #### MIC-1 datapath (21-bit)
 ```bash
 python3 gerar_log.py --mic programa_etapa2_tarefa2.txt registradores_etapa2_tarefa2.txt
+```
+
+#### MIC-1 with memory (23-bit)
+
+```bash
+python3 gerar_log.py --mic23 microinstruções_etapa3_tarefa1.txt \
+  registradores_etapa3_tarefa1.txt dados_etapa3_tarefa1.txt
+```
+
+#### Final IJVM program
+
+```bash
+python3 gerar_log.py --ijvm instruções.txt \
+  registradores_etapa3_atualizado.txt dados_etapa3_atualizado.txt
 ```
 
 ### Output
@@ -421,6 +507,12 @@ No more lines, EOP.
 | `programa_etapa2_tarefa1.txt` | 8-bit instruction program |
 | `programa_etapa2_tarefa2.txt` | 21-bit MIC-1 program |
 | `registradores_etapa2_tarefa2.txt` | Initial register state (binary format) |
+| `microinstruções_etapa3_tarefa1.txt` | 23-bit MIC-1 program with memory operations |
+| `registradores_etapa3_tarefa1.txt` | Initial registers for the Stage 3 example |
+| `dados_etapa3_tarefa1.txt` | Initial data memory for the Stage 3 example |
+| `instruções.txt` | Final IJVM example with `BIPUSH`, `DUP` and `ILOAD` |
+| `registradores_etapa3_atualizado.txt` | Initial registers for the complete IJVM example |
+| `dados_etapa3_atualizado.txt` | 16-word memory for the complete IJVM example |
 | `saida_etapa1.txt` | Expected output for Stage 1 |
 | `saida_etapa2_tarefa1.txt` | Expected output for Stage 2 Task 1 |
 | `saida_etapa2_tarefa2.txt` | Expected output for Stage 2 Task 2 |
